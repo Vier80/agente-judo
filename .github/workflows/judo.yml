@@ -1,0 +1,28 @@
+name: Agente Judo
+
+# Parte a tuo comando (Actions -> Agente Judo -> Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      solo_prova:
+        description: "Solo prova (non scrive su Notion)"
+        type: boolean
+        default: true
+
+jobs:
+  judo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Installa il necessario
+        run: pip install -r requirements.txt
+      - name: Leggi i risultati IJF
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          DRY_RUN: ${{ inputs.solo_prova }}
+        run: python -u scrape_judo.py
