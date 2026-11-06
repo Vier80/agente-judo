@@ -8,7 +8,7 @@ categorie di peso (7 uomini, 7 donne).
 Variabili: NOTION_TOKEN, NOTION_DATABASE_ID.
 Se DRY_RUN=true fa solo una prova: stampa i dati trovati senza scrivere su Notion.
 Impostazioni facoltative (variabili d'ambiente): DATA_INIZIO (default 2026-10-04, giorno
-d'inizio dei Mondiali di Baku), INCLUDI_OPEN=true per aggiungere anche i Continental Open.
+d'inizio dei Mondiali di Baku), INCLUDI_OPEN=true per aggiungere anche Open e Coppe continentali.
 """
 import datetime as dt
 import json
@@ -117,13 +117,13 @@ def classify(c):
         return "Grand Slam"
     if "grand prix" in rank:
         return "Grand Prix"
-    if "continental" in rank and "open" in rank:
-        return "Continental Open" if INCLUDI_OPEN else None
-    if "open" in name and "championship" not in name:
-        return "Continental Open" if INCLUDI_OPEN else None
-    if "continental" in rank or (
-            "championship" in name and clean(c.get("continent_short")).upper() not in ("", "IJF")):
-        return "Campionati continentali"
+    # i campionati continentali veri e propri hanno "Championships" nel nome; Open e Coppe
+    # continentali (es. Asian Open, European Cup) sono tornei minori e restano fuori
+    # a meno che si imposti INCLUDI_OPEN=true
+    if "championship" in name:
+        return "Campionati continentali" if clean(c.get("continent_short")).upper() not in ("", "IJF") else None
+    if "open" in rank or "open" in name or "cup" in rank or "cup" in name or "continental" in rank:
+        return "Continental Open/Cup" if INCLUDI_OPEN else None
     return None
 
 
