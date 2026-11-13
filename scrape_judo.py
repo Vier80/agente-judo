@@ -124,7 +124,13 @@ NEUTRALI = {"IJF", "AIN", "IRT", "EOR", "NEU", "ROT"}
 CAMPI_FORFAIT = re.compile(r"fusen|kiken|forfeit|walk.?over|withdr|medic|injur", re.I)
 # Nomi di campi da mostrare nella diagnosi: tipo di esito, stato, ecc.
 CAMPI_SOSPETTI = re.compile(r"fusen|kiken|forfeit|walk|withdr|medic|injur|win.?type|type.?win|"
-                            r"result|status|decision|hantei|ending|reason", re.I)
+                            r"result|status|decision|hantei|ending|reason|^type$", re.I)
+
+# Tornei in cui l'IJF ha registrato solo il vincitore (decisione del 13/11/2026):
+# se almeno questa quota degli incontri ha punteggio 0-0 e durata 00:00, il torneo è
+# "senza punteggi" e quegli incontri vengono scritti lo stesso, con Score = "n.d.".
+QUOTA_SENZA_PUNTI = 0.5
+SCORE_ND = "n.d."
 
 
 def die(msg):
@@ -152,6 +158,8 @@ DIAG = {
     "campi_contest": None,         # elenco dei campi di un incontro (una volta sola)
     "neutrali": [],                # esempi di campi "nazione" per atleti neutrali
     "neutrali_conteggio": Counter(),
+    "turni_tornei": defaultdict(set),  # turno non previsto -> tornei in cui compare
+    "tornei_senza_punti": [],      # tornei in cui l'IJF ha registrato solo il vincitore
 }
 
 
@@ -214,8 +222,14 @@ def classify(c):
         return None, "non senior (dal nome)"
     if "kata" in testo or "training camp" in testo or "seminar" in testo:
         return None, "kata / stage"
+    # discipline diverse dal judo olimpico: judo adattato, sordi, ciechi, ne-waza
+    if re.search(r"adapted|deaf|blind|ibsa|para judo|ne-?waza", testo):
+        return None, "disciplina diversa (adapted, ne-waza...)"
     if "masters" in testo:
         return None, "World Masters (escluso per scelta)"
+    # eventi regionali sudamericani: non sono campionati continentali né Giochi dell'elenco §5.1
+    if "south american" in testo:
+        return None, "evento regionale (Sudamerica)"
 
     # 2. tipi inclusi, dal più importante
     if "olympic games" in testo or rank.startswith("olympic"):
@@ -390,24 +404,22 @@ def contest_to_row(c, comp, kind, tz):
     rnd = clean(c.get("round_name"))
     duration = re.sub(r"^00:", "", clean(c.get("duration")))
 
-    # forfait, ritiri e decisioni mediche: esclusi (scheda 19 §5.4)
+    # forfait, ritiri e decisioni mediche (scheda 19 §5.4): qui li SEGNO soltanto.
+    # La decisione finale la prende collect_competition, che guarda il torneo intero:
+    # se quasi tutti gli incontri sono "vuoti", l'IJF non ha registrato i punteggi.
     flag = next((k for k, v in c.items() if CAMPI_FORFAIT.search(k) and str(v).strip() not in ("", "0", "None", "False")), None)
     motivo = None
     if flag:
         motivo = f"segnalato dal campo IJF '{flag}'"
     elif spiegazione_vittoria(c, win, lose) is None:
         motivo = "il punteggio non spiega la vittoria"
-    if motivo:
-        DIAG["esclusi"]["forfait / ritiro / decisione medica"] += 1
-        if len(DIAG["esempi_forfait"]) < 25:
-            DIAG["esempi_forfait"].append(
-                f"{clean(comp.get('name'))[:38]} | {weight} | {rnd} | {w_name} vs {b_name} | "
-                f"{score} | durata {duration or '?'} | vince {winner} | {motivo}")
-        return None
+    # incontro "vuoto": nessun punto né sanzione e durata zero
+    # (durata vuota o fatta solo di zeri e due punti: "", "00", "00:00", "00:00:00")
+    vuoto = score == "0 - 0" and re.fullmatch(r"[0:]*", duration) is not None
 
-    DIAG["turni"][rnd or "(vuoto)"] += 1
     cid = str(comp.get("id_competition"))
     return {
+        "_motivo": motivo, "_vuoto": vuoto and not flag,
         "id": f"{cid}|{c.get('id_fight')}",
         "p1": w_name, "noc1": w_noc, "id1": w_id,
         "p2": b_name, "noc2": b_noc, "id2": b_id,
@@ -431,20 +443,51 @@ def tz_for(comp_id):
 
 
 def collect_competition(kind, comp):
-    """Tutti gli incontri validi di un torneo, categoria per categoria."""
+    """Tutti gli incontri validi di un torneo, categoria per categoria.
+
+    Restituisce (righe valide, incontri letti, quanti scritti con Score "n.d.").
+    """
     cid = comp["id_competition"]
+    name = clean(comp.get("name"))
     tz = tz_for(cid)
-    rows, letti = {}, 0
+    candidati, letti = [], 0
     for wid, (gender, wname) in WEIGHTS.items():
         items = fetch_contests(cid, wid)
         letti += len(items)
         for c in items:
             r = contest_to_row(c, comp, kind, tz)
             if r:
-                rows[r["id"]] = r
+                candidati.append(r)
         if len(items) >= 1000:
             print(f"    ATTENZIONE: {gender} {wname}: raggiunto il limite di 1000 incontri")
-    return list(rows.values()), letti
+
+    # torneo senza punteggi? (almeno metà degli incontri con vincitore sono "vuoti")
+    vuoti = sum(1 for r in candidati if r["_motivo"] and r["_vuoto"])
+    senza_punti = bool(candidati) and vuoti >= QUOTA_SENZA_PUNTI * len(candidati)
+
+    rows, nd = {}, 0
+    for r in candidati:
+        motivo, vuoto = r.pop("_motivo"), r.pop("_vuoto")
+        if motivo:
+            if senza_punti and vuoto:
+                # l'IJF ha registrato solo il vincitore: si scrive con Score "n.d."
+                r["score"], r["duration"] = SCORE_ND, ""
+                nd += 1
+            else:
+                DIAG["esclusi"]["forfait / ritiro / decisione medica"] += 1
+                if len(DIAG["esempi_forfait"]) < 25:
+                    DIAG["esempi_forfait"].append(
+                        f"{name[:38]} | {r['weight']} | {r['round']} | {r['p1']} vs {r['p2']} | "
+                        f"{r['score']} | durata {r['duration'] or '?'} | vince {r['winner']} | {motivo}")
+                continue
+        rnd = r["round"] or "(vuoto)"
+        DIAG["turni"][rnd] += 1
+        if rnd not in TURNI_PREVISTI:
+            DIAG["turni_tornei"][rnd].add(name)
+        rows[r["id"]] = r
+    if senza_punti:
+        DIAG["tornei_senza_punti"].append(f"{name} (id {cid}): {nd} incontri con Score '{SCORE_ND}'")
+    return list(rows.values()), letti, nd
 
 
 # ------------------------------------------------------------------ Notion
@@ -570,7 +613,12 @@ def stampa_diagnosi(skipped):
     print("\n[Punto 4] Turni trovati negli incontri validi (* = turno non previsto):")
     for t, n in DIAG["turni"].most_common():
         segno = " " if t in TURNI_PREVISTI else "*"
-        print(f"  {segno} {t:<22} {n:>6}")
+        dove = "" if t in TURNI_PREVISTI else "  (" + "; ".join(sorted(DIAG["turni_tornei"][t])) + ")"
+        print(f"  {segno} {t:<22} {n:>6}{dove}")
+
+    print("\nTornei in cui l'IJF ha registrato solo il vincitore (Score 'n.d.'):")
+    for t in DIAG["tornei_senza_punti"] or ["nessuno"]:
+        print(f"  {t}")
 
     print("\n[Punto 5] Incontri esclusi per motivo:")
     for m, n in DIAG["esclusi"].most_common():
@@ -659,7 +707,7 @@ def main():
         cid = str(comp.get("id_competition"))
         print(f"\nLeggo {comp.get('name')} (id {cid}, {kind})")
         try:
-            matches, letti = collect_competition(kind, comp)
+            matches, letti, nd = collect_competition(kind, comp)
         except Exception as e:
             print(f"  Torneo non leggibile: {e}")
             errori += 1
@@ -679,6 +727,8 @@ def main():
         da_archiviare_tot += len(vecchie)
         print(f"  Incontri nei dati IJF: {letti}, validi: {len(matches)}, da scrivere: {len(nuovi)}"
               + (f", righe vecchie da archiviare: {len(vecchie)}" if MODALITA == "riscrivi" else ""))
+        if nd:
+            print(f"  ATTENZIONE: l'IJF ha registrato solo il vincitore: {nd} incontri scritti con Score '{SCORE_ND}'")
 
         if DRY_RUN:
             if matches:
