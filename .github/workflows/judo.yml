@@ -1,12 +1,17 @@
 name: Agente Judo
 
-# Parte a tuo comando (Actions -> Agente Judo -> Run workflow).
-# Più avanti (sessione 3) la lancerà anche cron-job.org ogni lunedì mattina.
+# Repo dell'agente dei risultati IJF, file .github/workflows/judo.yml
+# (versione 3 del 13/11/2026, scheda 19, sessione 3, passo 1).
+#
+# Parte in due modi:
+#   - a mano: Actions -> Agente Judo -> Run workflow;
+#   - ogni lunedì mattina da cron-job.org (sessione 3, passo 2), con solo_prova = false e modalita = aggiungi.
+# Alla fine, SOLO nel lancio vero, avvia il workflow "ELO Judo" del repo map-q-la28 (scheda 19 §5.10).
 on:
   workflow_dispatch:
     inputs:
       solo_prova:
-        description: "Solo prova: legge l'IJF e stampa le diagnosi, senza scrivere su Notion"
+        description: "Solo prova: legge l'IJF e stampa le diagnosi, senza scrivere su Notion (e senza avviare l'ELO)"
         type: boolean
         default: true
       data_inizio:
@@ -61,3 +66,38 @@ jobs:
           name: rapporto-judo
           path: rapporto_judo.txt
           if-no-files-found: ignore
+
+      # ------------------------------------------------------------------ NOVITÀ della sessione 3
+      - name: Avvia il calcolo ELO (workflow "ELO Judo" nel repo map-q-la28)
+        # Quando parte (scheda 19 §5.10):
+        #   - solo nel lancio vero, cioè quando solo_prova vale false.
+        #     format('{0}', ...) trasforma il valore in testo: così la condizione funziona sia quando
+        #     solo_prova arriva come vero/falso (lancio a mano) sia come testo "false" (cron-job.org);
+        #   - anche se l'agente ha avuto errori parziali o si è fermato per il limite di tempo:
+        #     l'ELO viene ricalcolato da zero sulle righe presenti in Notion e quelle mancanti
+        #     entreranno il lunedì successivo. "!cancelled()" = sempre, tranne se il lancio
+        #     è stato annullato a mano.
+        if: ${{ !cancelled() && format('{0}', inputs.solo_prova) == 'false' }}
+        env:
+          # token con permesso "Actions: Read and write" sul repo map-q-la28 (lo stesso dell'agente LA28)
+          PAGES_TOKEN: ${{ secrets.PAGES_TOKEN }}
+        run: |
+          if [ -z "$PAGES_TOKEN" ]; then
+            echo "ATTENZIONE: il segreto PAGES_TOKEN non c'è, quindi il calcolo ELO non parte."
+            echo "Lancialo a mano: repo map-q-la28 -> Actions -> ELO Judo -> Run workflow, senza spunta su solo_prova."
+            exit 1
+          fi
+          # gh è il programma di GitHub già installato sui server di Actions.
+          # "elo-judo.yml" è il nome del FILE del workflow (più sicuro del titolo, che si può cambiare);
+          # -f solo_prova=false = lancio vero: il calcolo scrive ELO in Athletes e salva judo-elo.json.
+          if GH_TOKEN="$PAGES_TOKEN" gh workflow run elo-judo.yml \
+               --repo "${{ github.repository_owner }}/map-q-la28" \
+               -f solo_prova=false; then
+            echo "Ho avviato 'ELO Judo' nel repo map-q-la28: il calcolo dura di solito pochi minuti."
+            echo "Lo trovi in map-q-la28 -> Actions -> ELO Judo."
+          else
+            echo "ATTENZIONE: non sono riuscito ad avviare 'ELO Judo'."
+            echo "Cause probabili: al token PAGES_TOKEN manca il permesso 'Actions: Read and write' su map-q-la28,"
+            echo "oppure il token è scaduto. Intanto lancia 'ELO Judo' a mano, senza spunta su solo_prova."
+            exit 1
+          fi
