@@ -1,13 +1,34 @@
 name: Agente Judo
 
 # Parte a tuo comando (Actions -> Agente Judo -> Run workflow).
+# Più avanti (sessione 3) la lancerà anche cron-job.org ogni lunedì mattina.
 on:
   workflow_dispatch:
     inputs:
       solo_prova:
-        description: "Solo prova (non scrive su Notion)"
+        description: "Solo prova: legge l'IJF e stampa le diagnosi, senza scrivere su Notion"
         type: boolean
         default: true
+      data_inizio:
+        description: "Primo giorno dei tornei (AAAA-MM-GG). Vuoto = ultimi 60 giorni"
+        type: string
+        default: ""
+      data_fine:
+        description: "Ultimo giorno dei tornei (AAAA-MM-GG). Vuoto = oggi"
+        type: string
+        default: ""
+      modalita:
+        description: "aggiungi = solo incontri nuovi; riscrivi = archivia e riscrive le righe nel vecchio formato"
+        type: choice
+        options:
+          - aggiungi
+          - riscrivi
+        default: aggiungi
+
+# due lanci contemporanei scriverebbero doppioni: il secondo aspetta che il primo finisca
+concurrency:
+  group: agente-judo
+  cancel-in-progress: false
 
 jobs:
   judo:
@@ -21,8 +42,22 @@ jobs:
       - name: Installa il necessario
         run: pip install -r requirements.txt
       - name: Leggi i risultati IJF
+        # "shell: bash" fa sì che un errore dello script colori di rosso il lancio anche con "tee"
+        shell: bash
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           DRY_RUN: ${{ inputs.solo_prova }}
-        run: python -u scrape_judo.py
+          DATA_INIZIO: ${{ inputs.data_inizio }}
+          DATA_FINE: ${{ inputs.data_fine }}
+          MODALITA: ${{ inputs.modalita }}
+          TEMPO_MAX_MINUTI: "165"
+        # "tee" scrive il log a video e, insieme, nel file rapporto_judo.txt
+        run: python -u scrape_judo.py | tee rapporto_judo.txt
+      - name: Conserva il rapporto (Artifacts in fondo alla pagina del lancio)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapporto-judo
+          path: rapporto_judo.txt
+          if-no-files-found: ignore
