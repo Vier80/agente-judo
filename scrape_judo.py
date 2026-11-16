@@ -1,4 +1,10 @@
-"""Agente Judo – risultati IJF (versione 2 del 13/11/2026, scheda 19, sessione 1)
+"""Agente Judo – risultati IJF (versione 2.1 del 16/11/2026, scheda 19)
+
+Versione 2.1 (16/11/2026): l'API di Notion restituisce al massimo 10.000 righe per ricerca.
+La lettura delle righe già presenti (leggi_righe_esistenti) è divisa in 14 ricerche, una per
+categoria di peso (Gender × Categoria), più una ricerca di controllo per le righe con categoria
+vuota o anomala. Se una ricerca arriva a 10.000 righe lo script si ferma invece di scrivere doppioni.
+Nessun'altra modifica rispetto alla versione 2 del 13/11/2026.
 
 Che cosa fa
 -----------
@@ -536,33 +542,101 @@ def testo_prop(prop):
     return "".join(p.get("plain_text", "") for p in parts).strip()
 
 
+# Una ricerca dell'API Notion restituisce al massimo 10.000 righe (scoperto il 16/11/2026, scheda 28 §3).
+LIMITE_NOTION = 10000
+
+
+def filtro_uguale(colonna, valore):
+    """Filtro Notion "colonna = valore". colonna = (nome, tipo) come in mapping."""
+    nome, tipo = colonna
+    return {"property": nome, tipo: {"equals": valore}}
+
+
+def fette_di_lettura(mapping):
+    """Le ricerche in cui viene divisa la lettura del db: [(etichetta, filtro), ...].
+
+    - 14 ricerche, una per categoria di peso (Gender × Categoria), circa 600 righe l'una.
+      Il filtro usa sia Gender sia Categoria;
+    - 1 ricerca "di controllo" per tutte le righe che non rientrano nelle 14 (Gender o Categoria
+      vuoti, scritti in modo diverso o in coppia sbagliata, es. Men con -48 kg).
+      Così nessuna riga resta fuori, qualunque cosa contenga. Di norma questa ricerca trova 0 righe.
+    Le 15 ricerche insieme coprono tutto il db e non si sovrappongono.
+    """
+    col_g, col_c = mapping["gender"], mapping["weight"]
+    fette, coppie = [], []
+    for gender, peso in WEIGHTS.values():
+        categoria = f"{peso} kg"                         # stesso testo che lo script scrive in Notion
+        coppie.append((gender, categoria))
+        fette.append((f"{gender} {categoria}",
+                      {"and": [filtro_uguale(col_g, gender), filtro_uguale(col_c, categoria)]}))
+    # Ricerca di controllo: "non è nessuna delle 14 coppie".
+    # Per ogni coppia: Gender diverso OPPURE Categoria diversa OPPURE uno dei due vuoto.
+    # (Notion permette due livelli di filtri annidati: "and" che contiene degli "or".)
+    nessuna = []
+    for gender, categoria in coppie:
+        nessuna.append({"or": [
+            {"property": col_g[0], col_g[1]: {"does_not_equal": gender}},
+            {"property": col_c[0], col_c[1]: {"does_not_equal": categoria}},
+            {"property": col_g[0], col_g[1]: {"is_empty": True}},
+            {"property": col_c[0], col_c[1]: {"is_empty": True}},
+        ]})
+    fette.append(("altre (Gender o Categoria vuoti o anomali)", {"and": nessuna}))
+    return fette
+
+
 def leggi_righe_esistenti(mapping):
     """Tutte le righe del db Agente Judo.
 
     Restituisce un dizionario  ID Univoco -> {"pagine": [id pagina, ...], "completa": vero/falso}.
     "completa" = la riga è già nel formato nuovo (Winner, ID IJF 1 e ID IJF 2 compilati).
+
+    Versione 2.1 (16/11/2026): l'API di Notion non restituisce più di 10.000 righe per ricerca.
+    Con una ricerca sola, oltre le 10.000 righe l'agente non vedrebbe le altre e le riscriverebbe
+    (doppioni). Per questo la lettura è divisa in 15 ricerche (fette_di_lettura). Se una arriva
+    a 10.000 righe, lo script si ferma invece di scrivere doppioni.
     """
     col_id = mapping["id"][0]
     col_w, col_1, col_2 = mapping["winner"][0], mapping["id1"][0], mapping["id2"][0]
-    righe, senza_id, cursor = {}, 0, None
-    while True:
-        body = {"page_size": 100}
-        if cursor:
-            body["start_cursor"] = cursor
-        data = notion("POST", f"/databases/{DATABASE_ID}/query", json=body)
-        for page in data["results"]:
-            p = page["properties"]
-            uid = testo_prop(p.get(col_id, {}))
-            if not uid:
-                senza_id += 1
-                continue
-            completa = all(testo_prop(p.get(c, {})) for c in (col_w, col_1, col_2))
-            info = righe.setdefault(uid, {"pagine": [], "completa": True})
-            info["pagine"].append(page["id"])
-            info["completa"] = info["completa"] and completa
-        if not data.get("has_more"):
-            break
-        cursor = data["next_cursor"]
+    righe, senza_id = {}, 0
+    pagine_viste = set()          # id delle pagine già lette (una pagina non viene mai contata due volte)
+    conteggi = []                 # (etichetta, righe lette) per il log
+    for etichetta, filtro in fette_di_lettura(mapping):
+        lette, cursor = 0, None
+        while True:
+            body = {"page_size": 100, "filter": filtro}
+            if cursor:
+                body["start_cursor"] = cursor
+            data = notion("POST", f"/databases/{DATABASE_ID}/query", json=body)
+            for page in data["results"]:
+                lette += 1
+                if page["id"] in pagine_viste:
+                    continue
+                pagine_viste.add(page["id"])
+                p = page["properties"]
+                uid = testo_prop(p.get(col_id, {}))
+                if not uid:
+                    senza_id += 1
+                    continue
+                completa = all(testo_prop(p.get(c, {})) for c in (col_w, col_1, col_2))
+                info = righe.setdefault(uid, {"pagine": [], "completa": True})
+                info["pagine"].append(page["id"])
+                info["completa"] = info["completa"] and completa
+            if not data.get("has_more"):
+                break
+            cursor = data["next_cursor"]
+        # controllo del limite: se una ricerca arriva a 10.000 righe, potrebbero esserne rimaste fuori
+        if lette >= LIMITE_NOTION:
+            die(f"la ricerca '{etichetta}' ha restituito {lette} righe, cioè il limite dell'API Notion: "
+                "alcune righe potrebbero non essere state lette e l'agente scriverebbe DOPPIONI. "
+                "Bisogna dividere ancora la lettura (per esempio per anno o per tipo di torneo).")
+        conteggi.append((etichetta, lette))
+    # riepilogo della lettura: il totale deve coincidere con il numero di righe del db in Notion
+    print(f"Righe lette dal db Notion: {len(pagine_viste)} in {len(conteggi)} ricerche "
+          f"(la più grande: {max(n for _, n in conteggi)} righe; limite di Notion {LIMITE_NOTION})")
+    print("  " + " · ".join(f"{e} {n}" for e, n in conteggi))
+    doppie = sum(len(v["pagine"]) - 1 for v in righe.values() if len(v["pagine"]) > 1)
+    if doppie:
+        print(f"Nota: {doppie} righe in Notion hanno un 'ID Univoco' già presente in un'altra riga (doppioni).")
     if senza_id:
         print(f"Nota: {senza_id} righe in Notion non hanno 'ID Univoco': lo script le lascia stare.")
     return righe
@@ -664,13 +738,8 @@ def main():
     if NOTION_TOKEN and DATABASE_ID:
         try:
             mapping = read_schema()
-            esistenti = leggi_righe_esistenti(mapping)
-            vecchie = sum(1 for v in esistenti.values() if not v["completa"])
-            print(f"Righe già presenti in Notion: {len(esistenti)}, di cui nel vecchio formato "
-                  f"(senza Winner o ID IJF): {vecchie}")
-            if vecchie and MODALITA == "aggiungi":
-                print("  (le righe vecchie restano come sono: per riscriverle usa la modalità 'riscrivi')")
         except SystemExit:
+            # colonna mancante: in prova si va avanti per vedere comunque le diagnosi IJF
             if not DRY_RUN:
                 raise
             print("In prova continuo comunque, ma prima del lancio vero le colonne vanno sistemate.")
@@ -678,6 +747,19 @@ def main():
             if not DRY_RUN:
                 raise
             print(f"Non riesco a leggere il db Notion ({e}). In prova continuo senza.")
+        if mapping:
+            try:
+                # NB: qui il limite delle 10.000 righe ferma lo script ANCHE in prova (die non viene intercettato)
+                esistenti = leggi_righe_esistenti(mapping)
+            except RuntimeError as e:
+                if not DRY_RUN:
+                    raise
+                print(f"Non riesco a leggere le righe del db Notion ({e}). In prova continuo senza.")
+            vecchie = sum(1 for v in esistenti.values() if not v["completa"])
+            print(f"Righe già presenti in Notion (ID Univoco diversi): {len(esistenti)}, di cui nel vecchio formato "
+                  f"(senza Winner o ID IJF): {vecchie}")
+            if vecchie and MODALITA == "aggiungi":
+                print("  (le righe vecchie restano come sono: per riscriverle usa la modalità 'riscrivi')")
     else:
         print("Token Notion assente: in prova non leggo il db.")
 
